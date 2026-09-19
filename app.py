@@ -17,12 +17,20 @@ import io
 import json
 import os
 import re
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from pypdf import PdfReader
 from google import genai
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, ListFlowable, ListItem
+)
 
 try:
     from dotenv import load_dotenv
@@ -32,8 +40,8 @@ except ImportError:
 
 st.set_page_config(page_title="AI Resume Analyzer", page_icon="📄", layout="wide")
 
-DEFAULT_MODEL = "gemini-3.6-flash"
-FALLBACK_MODEL = "gemini-2.5-flash"  # used if the primary model is overloaded
+DEFAULT_MODEL = "gemini-3.5-flash-lite"  # much higher free-tier daily quota
+FALLBACK_MODEL = "gemini-3.6-flash"  # higher quality, but only 20 free requests/day
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +89,11 @@ class GeminiClient:
                     return self._parse_json(response.text or "")
                 except Exception as e:
                     last_error = e
-                    if "503" in str(e) or "UNAVAILABLE" in str(e) or "overloaded" in str(e).lower():
-                        time.sleep(3)  # brief pause before retrying
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                        break  # this model's quota is used up for now; move straight to fallback
+                    if "503" in err_str or "UNAVAILABLE" in err_str or "overloaded" in err_str.lower():
+                        time.sleep(3)  # brief pause before retrying the same model
                         continue
                     raise RuntimeError(f"Gemini API request failed: {e}") from e
         raise RuntimeError(
@@ -259,9 +270,122 @@ def build_job_description_block(job_description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Session state setup
+# PDF report export
 # ---------------------------------------------------------------------------
-for key in ["resume_text", "analysis", "ats_result", "skill_gap", "job_matches", "cover_letter"]:
+def build_pdf_report(analysis, ats_result, skill_gap, job_matches, cover_letter) -> bytes:
+    """Compile whichever results are available into a single downloadable PDF report."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=letter,
+        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.7 * inch, rightMargin=0.7 * inch,
+    )
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("H1", parent=styles["Heading1"], spaceAfter=10, textColor=colors.HexColor("#1e293b"))
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], spaceBefore=14, spaceAfter=6, textColor=colors.HexColor("#2563eb"))
+    body = ParagraphStyle("Body", parent=styles["Normal"], spaceAfter=6, leading=14)
+    small = ParagraphStyle("Small", parent=styles["Normal"], fontSize=9, textColor=colors.grey)
+
+    story = []
+    story.append(Paragraph("Resume Analysis Report", h1))
+    story.append(Paragraph(f"Generated {datetime.now().strftime('%d %b %Y, %I:%M %p')}", small))
+    story.append(Spacer(1, 12))
+
+    def bullet_list(items):
+        return ListFlowable(
+            [ListItem(Paragraph(str(item), body)) for item in items],
+            bulletType="bullet", start="•",
+        )
+
+    if analysis:
+        story.append(Paragraph("Resume Analysis", h2))
+        story.append(Paragraph(f"<b>Summary:</b> {analysis.get('overall_summary', '')}", body))
+        if analysis.get("strengths"):
+            story.append(Paragraph("Strengths", styles["Heading3"]))
+            story.append(bullet_list(analysis["strengths"]))
+        if analysis.get("weaknesses"):
+            story.append(Paragraph("Weaknesses", styles["Heading3"]))
+            story.append(bullet_list(analysis["weaknesses"]))
+        if analysis.get("key_skills"):
+            story.append(Paragraph(f"<b>Key Skills:</b> {', '.join(analysis['key_skills'])}", body))
+        if analysis.get("years_of_experience_estimate"):
+            story.append(Paragraph(f"<b>Estimated Experience:</b> {analysis['years_of_experience_estimate']}", body))
+        if analysis.get("suggested_job_titles"):
+            story.append(Paragraph(f"<b>Suggested Job Titles:</b> {', '.join(analysis['suggested_job_titles'])}", body))
+        if analysis.get("improvement_recommendations"):
+            story.append(Paragraph("Improvement Recommendations", styles["Heading3"]))
+            story.append(bullet_list([
+                f"<b>{r.get('area', '')}:</b> {r.get('suggestion', '')}"
+                for r in analysis["improvement_recommendations"]
+            ]))
+
+    if ats_result:
+        story.append(Paragraph("ATS Score", h2))
+        story.append(Paragraph(f"<b>Overall Score:</b> {ats_result.get('ats_score', 0)}/100", body))
+        breakdown = ats_result.get("score_breakdown", {})
+        if breakdown:
+            table_data = [["Category", "Score"]] + [[k.replace("_", " ").title(), f"{v}/100"] for k, v in breakdown.items()]
+            t = Table(table_data, colWidths=[3 * inch, 1.5 * inch])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2563eb")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+                ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 8))
+        if ats_result.get("matched_keywords"):
+            story.append(Paragraph(f"<b>Matched Keywords:</b> {', '.join(ats_result['matched_keywords'])}", body))
+        if ats_result.get("missing_keywords"):
+            story.append(Paragraph(f"<b>Missing Keywords:</b> {', '.join(ats_result['missing_keywords'])}", body))
+        if ats_result.get("quick_wins"):
+            story.append(Paragraph("Quick Wins", styles["Heading3"]))
+            story.append(bullet_list(ats_result["quick_wins"]))
+
+    if skill_gap:
+        story.append(Paragraph("Skill Gap Analysis", h2))
+        story.append(Paragraph(f"<b>Match Percentage:</b> {skill_gap.get('match_percentage', 0)}%", body))
+        story.append(Paragraph(f"<b>Verdict:</b> {skill_gap.get('verdict', '')}", body))
+        if skill_gap.get("matching_skills"):
+            story.append(Paragraph("Matching Skills", styles["Heading3"]))
+            story.append(bullet_list(skill_gap["matching_skills"]))
+        if skill_gap.get("missing_skills"):
+            story.append(Paragraph("Missing Skills", styles["Heading3"]))
+            story.append(bullet_list([
+                f"[{g.get('importance', 'medium').upper()}] {g.get('skill', '')} — {g.get('how_to_acquire', '')}"
+                for g in skill_gap["missing_skills"]
+            ]))
+        if skill_gap.get("recommended_learning_path"):
+            story.append(Paragraph("Recommended Learning Path", styles["Heading3"]))
+            story.append(bullet_list(skill_gap["recommended_learning_path"]))
+
+    if job_matches:
+        story.append(Paragraph("Job Role Matching", h2))
+        for role in job_matches.get("recommended_roles", []):
+            story.append(Paragraph(
+                f"<b>{role.get('title', '')}</b> — Fit: {role.get('fit_score', 0)}% "
+                f"({role.get('typical_seniority', 'N/A')})", body
+            ))
+            story.append(Paragraph(role.get("reasoning", ""), small))
+            story.append(Spacer(1, 4))
+        if job_matches.get("career_trajectory_suggestion"):
+            story.append(Paragraph(f"<b>Career Trajectory:</b> {job_matches['career_trajectory_suggestion']}", body))
+
+    if cover_letter and cover_letter.get("cover_letter"):
+        story.append(Paragraph("Cover Letter", h2))
+        for para in cover_letter["cover_letter"].split("\n\n"):
+            if para.strip():
+                story.append(Paragraph(para.strip(), body))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
+for key in ["resume_text", "analysis", "ats_result", "skill_gap", "job_matches", "cover_letter", "_pdf_report"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -290,7 +414,7 @@ with st.sidebar:
 
     st.divider()
     if st.button("🔄 Reset session"):
-        for key in ["resume_text", "analysis", "ats_result", "skill_gap", "job_matches", "cover_letter"]:
+        for key in ["resume_text", "analysis", "ats_result", "skill_gap", "job_matches", "cover_letter", "_pdf_report"]:
             st.session_state[key] = None
         st.rerun()
 
@@ -315,7 +439,7 @@ def ensure_resume_text() -> bool:
             return False
         st.session_state.resume_text = text
         st.session_state._uploaded_name = uploaded_file.name
-        for key in ["analysis", "ats_result", "skill_gap", "job_matches", "cover_letter"]:
+        for key in ["analysis", "ats_result", "skill_gap", "job_matches", "cover_letter", "_pdf_report"]:
             st.session_state[key] = None
 
     return True
@@ -326,7 +450,7 @@ def ensure_resume_text() -> bool:
 # ---------------------------------------------------------------------------
 st.title("AI-Powered Resume Analyzer & Job Matching")
 
-tabs = st.tabs(["🔍 Resume Analysis", "🎯 ATS Score", "📊 Skill Gap", "💼 Job Matching", "✉️ Cover Letter"])
+tabs = st.tabs(["🔍 Resume Analysis", "🎯 ATS Score", "📊 Skill Gap", "💼 Job Matching", "✉️ Cover Letter", "📥 Export Report"])
 
 with tabs[0]:
     st.subheader("Resume Analysis")
@@ -524,3 +648,44 @@ with tabs[4]:
                                     file_name="cover_letter.txt", mime="text/plain")
                 if result.get("notes"):
                     st.caption("Notes: " + "; ".join(result["notes"]))
+
+with tabs[5]:
+    st.subheader("Export Full Report")
+    st.caption("Compiles every analysis you've run so far into one downloadable PDF.")
+
+    results_available = any([
+        st.session_state.analysis, st.session_state.ats_result, st.session_state.skill_gap,
+        st.session_state.job_matches, st.session_state.cover_letter,
+    ])
+
+    if not results_available:
+        st.info("Run at least one analysis in the other tabs first — this report includes whatever you've generated so far.")
+    else:
+        included = []
+        if st.session_state.analysis: included.append("Resume Analysis")
+        if st.session_state.ats_result: included.append("ATS Score")
+        if st.session_state.skill_gap: included.append("Skill Gap")
+        if st.session_state.job_matches: included.append("Job Matching")
+        if st.session_state.cover_letter: included.append("Cover Letter")
+        st.write("**This report will include:** " + ", ".join(included))
+
+        if st.button("📄 Generate PDF Report"):
+            with st.spinner("Building your report..."):
+                try:
+                    pdf_bytes = build_pdf_report(
+                        st.session_state.analysis, st.session_state.ats_result,
+                        st.session_state.skill_gap, st.session_state.job_matches,
+                        st.session_state.cover_letter,
+                    )
+                    st.session_state["_pdf_report"] = pdf_bytes
+                    st.success("Report ready!")
+                except Exception as e:
+                    st.error(f"Couldn't build the PDF: {e}")
+
+        if st.session_state.get("_pdf_report"):
+            st.download_button(
+                "⬇️ Download PDF Report",
+                data=st.session_state["_pdf_report"],
+                file_name="resume_analysis_report.pdf",
+                mime="application/pdf",
+            )
